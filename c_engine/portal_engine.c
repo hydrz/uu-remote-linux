@@ -967,8 +967,8 @@ int uu_portal_monitors(char *out, size_t length) {
     for (gsize i = 0; i < g_variant_n_children(logical); i++) {
         gint32 x, y; gdouble scale; guint32 transform; gboolean primary; GVariant *specs, *props;
         g_variant_get_child(logical, i, "(iidub@a(ssss)@a{sv})", &x, &y, &scale, &transform, &primary, &specs, &props);
-        const gchar *connector = NULL;
-        if (g_variant_n_children(specs)) g_variant_get_child(specs, 0, "(&s&s&s&s)", &connector, NULL, NULL, NULL);
+        const gchar *connector = NULL, *serial = NULL;
+        if (g_variant_n_children(specs)) g_variant_get_child(specs, 0, "(&s&s&s&s)", &connector, NULL, NULL, &serial);
         gint32 width = 0, height = 0;
         for (gsize m = 0; connector && m < g_variant_n_children(monitors); m++) {
             GVariant *monitor = g_variant_get_child_value(monitors, m), *spec = g_variant_get_child_value(monitor, 0),
@@ -985,7 +985,7 @@ int uu_portal_monitors(char *out, size_t length) {
         }
         if (transform % 2) { gint32 t = width; width = height; height = t; } /* 90/270, flipped or not */
         if (connector && width > 0 && height > 0) {
-            int n = snprintf(out + used, length - used, "%s\t%d\t%d\t%d\t%d\t%d\n", connector, width, height, x, y, primary ? 1 : 0);
+            int n = snprintf(out + used, length - used, "%s\t%d\t%d\t%d\t%d\t%d\t%s\n", connector, width, height, x, y, primary ? 1 : 0, serial ? serial : "");
             if (n > 0 && (size_t)n < length - used) { used += (size_t)n; count++; }
         }
         g_variant_unref(specs); g_variant_unref(props);

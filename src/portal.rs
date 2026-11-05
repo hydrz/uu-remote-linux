@@ -112,7 +112,7 @@ mod native {
             was_locked.store(false, std::sync::atomic::Ordering::Release);
         }
     }
-    pub struct Session { handle: Mutex<Handle>, locked: tokio::sync::watch::Receiver<Option<bool>>, was_locked: std::sync::atomic::AtomicBool, recovery: Mutex<Recovery>, size: std::sync::atomic::AtomicU64, monitor: Mutex<Option<String>>, virtual_output: std::sync::atomic::AtomicBool }
+    pub struct Session { handle: Mutex<Handle>, locked: tokio::sync::watch::Receiver<Option<bool>>, was_locked: std::sync::atomic::AtomicBool, recovery: Mutex<Recovery>, size: std::sync::atomic::AtomicU64, monitor: Mutex<Option<String>>, virtual_output: std::sync::atomic::AtomicBool, spare: Mutex<Vec<(String, Handle, (u32, u32))>> }
     impl Session {
         fn take_lock_observation(&self) -> Result<bool, String> {
             // A recovery in progress must see the lock even if another capture
@@ -260,7 +260,7 @@ mod native {
             if wanted.is_some() && granted != wanted { log::warn!("Portal granted a different monitor than requested"); }
             // Keep a freshly granted compositor frame regardless of lock state. Discarding it
             // before new damage can leave a static desktop permanently blank (#2).
-            Ok(Self { handle: Mutex::new(Handle(handle)), locked: crate::session_lock::watch_locked(), was_locked: std::sync::atomic::AtomicBool::new(false), recovery: Mutex::new(Recovery::default()), size: pack(width, height).into(), monitor: Mutex::new(granted), virtual_output: virtual_output.into() })
+            Ok(Self { handle: Mutex::new(Handle(handle)), locked: crate::session_lock::watch_locked(), was_locked: std::sync::atomic::AtomicBool::new(false), recovery: Mutex::new(Recovery::default()), size: pack(width, height).into(), monitor: Mutex::new(granted), virtual_output: virtual_output.into(), spare: Mutex::new(Vec::new()) })
         }
         /// Frame pixels of the monitor the stream currently follows.
         pub fn size(&self) -> (u32, u32) {
@@ -270,6 +270,8 @@ mod native {
         /// End the compositor session (screen-share indicator off); the next desktop
         /// connection reopens it with the saved consent.
         pub fn end(&self) {
+            // Parked twins hold live portal sessions of their own; a disconnect closes them too.
+            if let Ok(mut spare) = self.spare.lock() { spare.clear(); }
             if let Ok(handle) = self.handle.lock() { unsafe { uu_portal_end(handle.0.as_ptr()) }; }
         }
         /// Mutter connector of the monitor this session captures, when several are advertised.
@@ -278,20 +280,53 @@ mod native {
         /// time GNOME asks on the host) and swap it in, so every holder of this Arc follows.
         pub fn switch_to(&self, connector: &str) -> Result<(), String> {
             if self.monitor().as_deref() == Some(connector) { return Ok(()); }
-            let replacement = Self::open_inner(None, Some(connector), false, false).map_err(|error| error.to_string())?;
-            if replacement.monitor().as_deref() != Some(connector) {
-                return Err("Another monitor was shared; choose this monitor in the host dialog".into());
-            }
-            let size = replacement.size();
-            let next = replacement.handle.into_inner().map_err(|_| "Portal session lock poisoned")?;
+            // Saved consent is resolved on the host by monitor identity (vendor/product/serial),
+            // and a PBP monitor splits one panel into two connectors that share one identity, so
+            // restoring one half's consent can silently grant the other half. Such twins keep
+            // their portal session parked instead of closing it and swap it back on the next
+            // switch: a live session needs no consent round trip. Others retry a restore that
+            // came back with a different monitor than requested via a fresh request, which
+            // grants exactly the monitor picked in the host dialog.
+            let mut spare = self.spare.lock().map_err(|_| "Portal session lock poisoned")?;
+            let parked = Self::parked(connector, &mut spare);
+            drop(spare);
+            let (next, size) = match parked {
+                Some(parked) => { log::info!("Portal switch to {connector}: reused the parked session"); parked }
+                None => {
+                    let first = Self::open_inner(None, Some(connector), false, false).map_err(|error| error.to_string())?;
+                    let replacement = if first.monitor().as_deref() == Some(connector) { first } else {
+                        log::info!("Portal switch to {connector}: the host granted {} instead; asking for a fresh choice",
+                            first.monitor().as_deref().unwrap_or("another monitor"));
+                        drop(first);
+                        let retried = Self::open_inner(None, Some(connector), true, false).map_err(|error| error.to_string())?;
+                        if retried.monitor().as_deref() != Some(connector) {
+                            return Err("Another monitor was shared; choose this monitor in the host dialog".into());
+                        }
+                        retried
+                    };
+                    let size = replacement.size();
+                    (replacement.handle.into_inner().map_err(|_| "Portal session lock poisoned")?, size)
+                }
+            };
+            let (previous_monitor, previous_size) = (self.monitor(), self.size());
             let previous = {
                 let mut handle = self.handle.lock().map_err(|_| "Portal session lock poisoned")?;
                 self.size.store(pack(size.0, size.1), std::sync::atomic::Ordering::Release);
                 std::mem::replace(&mut *handle, next)
             };
             if let Ok(mut monitor) = self.monitor.lock() { *monitor = Some(connector.to_owned()); }
-            drop(previous);
+            let mut spare = self.spare.lock().map_err(|_| "Portal session lock poisoned")?;
+            match previous_monitor {
+                Some(name) if super::shares_identity(&monitors(), &name) => spare.push((name, previous, previous_size)),
+                _ => drop(previous),
+            }
             Ok(())
+        }
+        /// Take a parked session for `connector` if one is alive; a dead one is closed.
+        fn parked(connector: &str, spare: &mut Vec<(String, Handle, (u32, u32))>) -> Option<(Handle, (u32, u32))> {
+            let index = spare.iter().position(|(name, ..)| name == connector)?;
+            let (_, handle, size) = spare.swap_remove(index);
+            (unsafe { uu_portal_alive(handle.0.as_ptr()) } != 0).then_some((handle, size))
         }
         pub fn is_virtual(&self) -> bool { self.virtual_output.load(std::sync::atomic::Ordering::Acquire) }
         /// Privacy screen: capture and input move to a KWin virtual output (on) or back to the
@@ -300,6 +335,8 @@ mod native {
             if self.is_virtual() == on { return Ok(()); }
             // Closure recovery would otherwise see the replaced share end and reopen the wrong source.
             let _recovery = self.recovery.lock().map_err(|_| "Portal recovery lock poisoned")?;
+            // Privacy: a parked physical session would keep streaming the screen.
+            if on { if let Ok(mut spare) = self.spare.lock() { spare.clear(); } }
             let monitor = self.monitor();
             // KDE restores a monitor share against the whole workspace while the virtual output
             // exists (seen live: 3968x1280 = panel + virtual), so end the virtual share first.
@@ -607,6 +644,7 @@ mod native {
                     recovery: Mutex::new(Recovery::default()),
                     size: pack(physical.0, physical.1).into(),
                     monitor: Mutex::new(None), virtual_output: false.into(),
+                    spare: Mutex::new(Vec::new()),
                 }))
             }
 
@@ -933,7 +971,7 @@ pub fn switch_active(connector: &str) -> Result<(), String> {
         .ok_or("Portal desktop unavailable")?;
     session.switch_to(connector)
 }
-pub struct Monitor { pub connector: String, pub width: u32, pub height: u32, pub x: i32, pub y: i32, pub primary: bool }
+pub struct Monitor { pub connector: String, pub width: u32, pub height: u32, pub x: i32, pub y: i32, pub primary: bool, pub serial: String }
 #[cfg(all(target_os = "linux", feature = "portal"))]
 pub use native::monitors;
 #[cfg(not(all(target_os = "linux", feature = "portal")))]
@@ -945,9 +983,19 @@ fn parse_monitors(text: &str) -> Vec<Monitor> {
         let connector = f.next()?.to_owned();
         let (width, height) = (f.next()?.parse().ok()?, f.next()?.parse().ok()?);
         let (x, y, primary) = (f.next()?.parse().ok()?, f.next()?.parse().ok()?, f.next()? == "1");
+        let serial = f.next().unwrap_or_default().to_owned();
         (!connector.is_empty() && connector.len() <= 64 && connector.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_'))
-            .then_some(Monitor { connector, width, height, x, y, primary })
+            .then_some(Monitor { connector, width, height, x, y, primary, serial })
     }).collect()
+}
+
+/// Whether `connector`'s monitor shares its identity (vendor/product/serial) with another
+/// connector: one PBP panel seen as two monitors. Host-side consent restore resolves by identity
+/// and cannot tell them apart, so their portal sessions are parked and swapped back instead of
+/// reopened.
+pub fn shares_identity(monitors: &[Monitor], connector: &str) -> bool {
+    let Some(serial) = monitors.iter().find(|m| m.connector == connector).map(|m| m.serial.as_str()) else { return false; };
+    !serial.is_empty() && monitors.iter().any(|m| m.connector != connector && m.serial == serial)
 }
 
 /// Forward frames in-process into encoder stdin. Cancellation drops the Arc;
@@ -978,6 +1026,20 @@ mod tests {
         let m = super::parse_monitors("eDP-1\t2880\t1800\t0\t0\t1\nHDMI-1\t2560\t1440\t1920\t0\t0\n../x\t1\t1\t0\t0\t0\n");
         assert_eq!(m.len(), 2);
         assert!(m[0].primary && m[0].connector == "eDP-1" && (m[1].width, m[1].x) == (2560, 1920));
+        // The serial is optional: engines before it keep parsing, one with it is kept verbatim.
+        assert_eq!(m[0].serial, "");
+        let with_serial = super::parse_monitors("DP-1\t1920\t2160\t2560\t0\t0\t0x000f69b5\n");
+        assert_eq!(with_serial[0].serial, "0x000f69b5");
+    }
+    #[test]
+    fn pbp_halves_share_identity_but_distinct_panels_do_not() {
+        let monitors = super::parse_monitors("DP-1\t1\t1\t0\t0\t0\t0x000f69b5\nHDMI-1\t1\t1\t1\t0\t0\t0x000f69b5\nDP-3\t1\t1\t2\t0\t1\tUHB2341049441\n");
+        assert!(super::shares_identity(&monitors, "DP-1"));
+        assert!(super::shares_identity(&monitors, "HDMI-1"));
+        assert!(!super::shares_identity(&monitors, "DP-3"));
+        // Unknown connectors and engines without a serial never park sessions.
+        assert!(!super::shares_identity(&monitors, "USB-C-9"));
+        assert!(!super::shares_identity(&super::parse_monitors("DP-1\t1\t1\t0\t0\t1\nHDMI-1\t1\t1\t1\t0\t0\n"), "DP-1"));
     }
     #[test]
     fn locked_frames_hide_old_content() { let mut frame = [42; 8]; super::blank(&mut frame); assert_eq!(frame, [0,0,0,255,0,0,0,255]); }
